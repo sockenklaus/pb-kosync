@@ -462,6 +462,22 @@ cmd_push() {
     target=$LP_TARGET
     digest=$(partial_md5 "$target")
     [ -n "$digest" ] || { log "push[$oid]: digest failed for $target"; continue; }
+    # Regression guard: never push a reading position that is BEHIND the last
+    # synced one. A reader that opens a book at page 1 (a failed seek, or its
+    # own first-open reset) would otherwise clobber a real reading position the
+    # other device already saved on the server. Forward progress (local ahead
+    # of the last sync) still pushes; a first-ever sync (no stored position)
+    # is always allowed. (ST_PPOS/ST_PPROG were set by the state_get in push_due.)
+    state_get "$oid"
+    if [ -n "${ST_PPOS:-}" ]; then
+      lpct=${LP_PCT:-0}; case "$lpct" in ''|*[!0-9.]*) lpct=0 ;; esac
+      spct=${ST_PPROG:-0}; case "$spct" in ''|*[!0-9.]*) spct=0 ;; esac
+      behind=$(awk -v a="$lpct" -v b="$spct" 'BEGIN{print (a+0 < b+0-0.005)?1:0}')
+      if [ "${behind:-0}" = "1" ]; then
+        log "push[$oid]: local pct $lpct is behind last-synced $spct (reader reset / first-open); NOT pushing (protects server position)"
+        continue
+      fi
+    fi
     # Choose the progress locator to send (KOSync-friendly).
     if printf '%s' "$pos" | grep -q 'epubcfi'; then
       loc=$(extract_cfi "$pos")
