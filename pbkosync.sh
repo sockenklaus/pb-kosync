@@ -427,6 +427,45 @@ library_oids() {
   q_ro "SELECT DISTINCT BookID FROM Files;" | awk 'NF' | sort -n -u | tr '\n' ' '
 }
 
+# Space-separated set of oids that already have a sync-state line (adopted or
+# cleared). Local-only; no network.
+state_oids() {
+  [ -r "$STATE_FILE" ] || return 0
+  awk 'NF{print $1}' "$STATE_FILE" 2>/dev/null | tr '\n' ' '
+}
+
+# 0 (true) if any book that HAS a readable file has NO sync-state line yet —
+# i.e. a never-adopted, adoptable book is present in the library. Local-only:
+# a library query, a set-diff against the (small) state file, and — only for
+# the (few) not-yet-synced books — a readable-file check. No network. Used to
+# fire the adoption pass immediately when a new book lands, instead of waiting
+# for the PULL_SEC window.
+#
+# The readable-file requirement is what keeps this consistent with cmd_adopt,
+# which SKIPS a book that has no readable file (still downloading, or a ghost
+# row in the Files table). Without it, such a book would stay "new" forever
+# and re-trigger the adoption pass every tick (adopted=0 cleared=0 forever).
+# Bounded: once a book is adopted or cleared it gets a state line, so this
+# returns to false until the next genuinely-new book appears.
+has_new_book() {
+  card_ready || return 1
+  lib=$(library_oids)
+  [ -n "$lib" ] || return 1
+  so=" $(state_oids) "
+  for oid in $lib; do
+    [ -n "$oid" ] || continue
+    case "$so" in
+      *" $oid "*) continue ;;   # already has a state line -> not new
+    esac
+    # New book: only trigger-worthy if it actually has a readable file — the
+    # same book cmd_adopt would adopt or clear (book_all_files is non-empty).
+    if [ -n "$(book_all_files "$oid" 2>/dev/null)" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 # A book's readable file(s), epub-first then pdf, then the rest (deduped,
 # order preserved). Handles names with spaces (newline-separated).
 book_all_files() { # $1=oid -> one readable file path per line
@@ -865,6 +904,20 @@ cmd_loop() {
             cmd_pull
           fi
           last_pull=$n
+        fi
+      fi
+      # Event-driven adoption: if a brand-new book (has a file, but no
+      # sync-state line yet) has landed in the library, adopt it NOW instead of
+      # waiting for the PULL_SEC window. The check is local-only (one library
+      # query + a set-diff); the network adopt runs only once per genuinely-new
+      # book, so it stays bounded. The periodic adopt above already ran on the
+      # PULL_SEC boundary, so any book it just cleared is no longer "new" here
+      # and won't be double-adopted. Does not touch last_pull, so the periodic
+      # pull cadence for already-synced books is unaffected.
+      if [ "$PULL_ENABLED" = "1" ] && has_new_book; then
+        if auth_ok; then
+          offline_streak=0
+          cmd_adopt
         fi
       fi
       # Push: only touch the network if a local change is actually pending.
