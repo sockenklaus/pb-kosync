@@ -1,0 +1,25 @@
+# pb-kosync configuration — copy to `config` and fill in.
+#
+# CWA_URL   Base URL of your Calibre-Web-Automated instance (no trailing slash,
+#           no /kosync suffix). The agent appends /kosync/... itself.
+CWA_URL="http://192.168.XX.XX:8080"
+CWA_USER="your_cwa_account"
+CWA_PASS="your_password"
+
+# Human-readable device name reported to CWA (shows up in the sync log).
+DEVICE_NAME="PocketBook Era Color"
+
+# Polling behaviour.
+POLL_SEC=15        # how often (s) the loop checks for changed progress
+PULL_SEC=300       # how often (s) the loop fetches server progress back
+PULL_ENABLED=1     # 0 = push-only, 1 = bidirectional
+PUSH_COOLDOWN=90   # min seconds between pushes of the same book
+# The reader process lingers after a book is closed; a pull is skipped for a
+# book while the reader is alive AND its position state changed within this
+# window (active reading). After that the book is considered closed.
+PULL_READER_BUSY_SEC=120
+
+CURL_MAX=20        # per-request timeout (s)
+
+# Where the SD card is mounted (books.db / reader state live under here).
+DATA_DIR=/mnt/ext1

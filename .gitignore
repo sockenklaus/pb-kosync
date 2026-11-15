@@ -1,0 +1,9 @@
+# secrets / per-machine configuration
+config
+
+# runtime artifacts (created on the device; local leftovers from testing)
+state
+log
+.pid
+.id
+books.db.bak
