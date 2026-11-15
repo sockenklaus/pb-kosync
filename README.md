@@ -94,6 +94,45 @@ PocketBook Era Color (native reader)
 
 ## Setup
 
+### Prerequisite — unlock developer mode (one-time; enables root SSH over USB)
+
+The agent is driven entirely over **SSH to `root@192.168.205.1`** through the
+USB cable. Recent PocketBook firmware ships with the SSH daemon **disabled**,
+so you must enable developer mode first — a one-time privilege escalation from
+a known PocketBook exploit. Confirmed on the **PocketBook Era Color (U700k3),
+OS 6.10.2359**. Source thread:
+<https://www.mobileread.com/forums/showthread.php?t=371671>
+
+1. **Get a terminal on the device.** Install *pbterm*, choosing the release
+   build that matches your device's SoC (see the release notes):
+   <https://github.com/leomeyer/pbterm>. Copy the binary to
+   `ext1/applications/` (via USB File Transfer) and launch it from the app list.
+
+2. **Enable developer mode.** In pbterm, run:
+
+   ```sh
+   sh -c '/usr/cramfs/bin/iv2sh WriteConfig /mnt/secure/developer_mode privesc 1'
+   ```
+
+   Then **reboot** the device. (The underlying privilege escalation is the one
+   described in the redguard.ch advisory for recent PocketBooks:
+   <https://www.redguard.ch/blog/2025/03/04/security-advisory-pocketbook-inkpad-color-3/>.)
+
+3. **Connect to SSH via USB.** Connect the device to a computer via USB. This starts sshd. The daemon listens on `192.168.205.1`.
+
+   ```sh
+   ssh -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa root@192.168.205.1
+   ```
+
+   When this drops you into a root shell, the setup below works. An OS update
+   can reset developer mode — if SSH stops working, re-run step 2.
+
+> The same session can also enable **OPDS** browsing (how new books get
+> downloaded to the device) — see the steps after the developer-mode unlock in
+> the source thread.
+
+Then:
+
 ```sh
 cp config.example config      # fill in CWA_URL / CWA_USER / CWA_PASS
 ./deploy.sh                   # copy to device, add boot hook in /etc/init.d/rcS
