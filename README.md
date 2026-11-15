@@ -46,6 +46,17 @@ PocketBook Era Color (native reader)
   `time_opened`), and the per-book `position.cfg` — including the trailing
   `#<crc32>` line the reader validates (CRC32 implemented in awk, verified
   against reader-written files).
+- **New-book adoption** (downloaded via OPDS, already read on another device):
+  KOSync has no "list my progress" endpoint, so the agent discovers books by
+  computing the digest of every local library file. Each pull cycle it consults
+  the server for books it has *never* synced: if CWA holds a position, it is
+  adopted into all three stores (so the reader resumes where the phone left
+  off); if CWA is empty the book is marked "cleared" so a later local read can
+  still push a baseline. This always runs **before** any push, so opening a
+  book on the device can never push a fresh page 1 over the phone's saved
+  position. Each book is probed only once (adopted or cleared), keeping the
+  network cost to a single GET per new book. Actively-open books are never
+  yanked (same busy guard as pulls).
 - **Reader-busy guard**: the reader process lingers after a book is closed,
   so "process alive" alone would block pulls for hours. A pull for a book is
   skipped only while the reader process (`READER_PROC`, default
@@ -87,7 +98,7 @@ PocketBook Era Color (native reader)
 cp config.example config      # fill in CWA_URL / CWA_USER / CWA_PASS
 ./deploy.sh                   # copy to device, add boot hook in /etc/init.d/rcS
 # verify credentials:
-ssh … 'root@192.168.205.1 /mnt/secure/pb-kosync/pbkosync.sh check-auth'
+ssh root@192.168.205.1 '/mnt/secure/pb-kosync/pbkosync.sh check-auth'
 ./deploy.sh start             # deploy + start daemon now
 ```
 
@@ -95,7 +106,8 @@ On the device (via SSH, USB mode only):
 
 ```sh
 /mnt/secure/pb-kosync/pbkosync.sh status      # config, state, log, pid
-/mnt/secure/pb-kosync/pbkosync.sh once        # one push+pull now
+/mnt/secure/pb-kosync/pbkosync.sh once        # one adopt+push+pull now
+/mnt/secure/pb-kosync/pbkosync.sh adopt       # adopt never-synced books from the server
 /mnt/secure/pb-kosync/pbkosync.sh push        # push only
 /mnt/secure/pb-kosync/pbkosync.sh pull        # pull only
 /mnt/secure/pb-kosync/pbkosync.sh localcheck [oid…]   # offline position diagnostics

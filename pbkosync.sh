@@ -381,17 +381,62 @@ progress_oids() {
   { printf '%s\n' "$a"; printf '%s\n' "$b"; } | awk 'NF' | sort -n -u | tr '\n' ' '
 }
 
+# Every book in the library that has at least one file (so we can compute a
+# KOReader digest). This is the SUPERSET of progress_oids — it also includes
+# books we have never opened locally, which is what lets the agent discover a
+# book that was downloaded via OPDS and read on another device: CWA holds the
+# position, the local library holds the file, and the digest is the key that
+# ties the two together (KOSync has no "list my progress" endpoint).
+library_oids() {
+  q_ro "SELECT DISTINCT BookID FROM Files;" | awk 'NF' | sort -n -u | tr '\n' ' '
+}
+
+# A book's readable file(s), epub-first then pdf, then the rest (deduped,
+# order preserved). Handles names with spaces (newline-separated).
+book_all_files() { # $1=oid -> one readable file path per line
+  bf=$(book_files "$1")
+  [ -n "$bf" ] || return 1
+  {
+    printf '%s\n' "$bf" | grep -i '\.epub$'
+    printf '%s\n' "$bf" | grep -i '\.pdf$'
+    printf '%s\n' "$bf"
+  } | awk 'NF && !seen[$0]++' | while IFS= read -r f; do
+      [ -r "$f" ] && printf '%s\n' "$f"
+    done
+}
+
+# Mark a never-synced book "cleared": we probed the server and it has no
+# record for it. An empty digest + a non-zero dev_ts distinguishes "cleared,
+# safe to push a baseline" from "never probed, must consult the server first"
+# (see push_due), and keeps the adoption pass from re-probing it.
+sentinel_clear() { # $1=oid
+  state_set "$1" "" "" "" "$(now)" "$(now)"
+}
+
 # --- push --------------------------------------------------------------------
 # A book is "due" for push when its LOCAL POSITION differs from what we last
 # pushed AND the per-book cooldown has elapsed. The percentage float is
 # derived data (different writers format it differently), so only the
 # position (normalized) decides. Local-only, no network.
+#
+# A never-synced book is NOT automatically push-due in pull-enabled mode: the
+# adoption pass must get the first look at the server record, otherwise a
+# freshly-opened page 1 would be pushed and clobber a position the other
+# device already saved. In push-only mode there is nothing to protect, so the
+# baseline push is allowed immediately.
 push_due() { # $1=oid -> 0 if due
   local_progress "$1" || return 1
   state_get "$1"
-  [ -n "$ST_DIGEST" ] || return 0   # never synced -> push to establish baseline
+  if [ -z "$ST_DIGEST" ]; then
+    case "${ST_DEVTS:-0}" in
+      ''|*[!0-9]*) devts_n=0 ;; *) devts_n=$ST_DEVTS ;;
+    esac
+    if [ "$devts_n" -le 0 ] && [ "$PULL_ENABLED" = "1" ]; then
+      return 1   # defer until the adoption pass has consulted the server
+    fi
+  fi
   lp=$(norm_loc "$LP_POS")
-  sp=$(norm_loc "$ST_PPOS")
+  sp=$(norm_loc "${ST_PPOS:-}")
   [ "$lp" = "$sp" ] && return 1   # same reading position as last sync
   if [ "${ST_DEVTS:-0}" -gt 0 ] 2>/dev/null; then
     age=$(expr "$(now)" - "$ST_DEVTS" 2>/dev/null)
@@ -563,6 +608,74 @@ apply_pull() { # $1=oid $2=target $3=server_progress $4=server_percentage $5=ser
   log "pull[$oid]: applied -> $APPLIED_PBR (pct=$spct ts=$sts)"
 }
 
+# Adoption: for books we have never synced, consult the server BEFORE we ever
+# push a local baseline. This is what makes "downloaded via OPDS, already read
+# on another device" work — CWA holds the position, the local library holds
+# the file, and the digest ties them together. Runs before push (see loop),
+# on the pull interval, and only for never-probed books (bounded one-time cost
+# per book; a book drops out once adopted or once the server is confirmed empty).
+cmd_adopt() {
+  card_ready || return 0
+  oids=$(library_oids)
+  [ -n "$oids" ] || return 0
+  adopted=0; cleared=0
+  for oid in $oids; do
+    state_get "$oid"
+    [ -z "$ST_DIGEST" ] || continue          # already synced/adopted
+    case "${ST_DEVTS:-0}" in
+      ''|*[!0-9]*) devts_n=0 ;; *) devts_n=$ST_DEVTS ;;
+    esac
+    [ "$devts_n" -gt 0 ] && continue          # already probed: server had no record
+    # Try each readable file format until one resolves to a server record.
+    book_all_files "$oid" > "$AGENT_DIR/.adoptfiles" 2>/dev/null
+    [ -s "$AGENT_DIR/.adoptfiles" ] || { rm -f "$AGENT_DIR/.adoptfiles" 2>/dev/null; continue; }
+    found=""; ftarget=""; fdigest=""; fspct=""; fsprog=""; fst=0
+    while IFS= read -r target; do
+      [ -n "$target" ] || continue
+      [ -r "$target" ] || continue
+      digest=$(partial_md5 "$target")
+      [ -n "$digest" ] || continue
+      api_get "$digest" || continue
+      [ "${REPLY_CODE:-0}" = "200" ] || continue
+      pct=$(json_get "$REPLY_BODY" percentage)
+      [ -n "$pct" ] || continue
+      found=1; ftarget=$target; fdigest=$digest; fspct=$pct
+      fsprog=$(json_get "$REPLY_BODY" progress)
+      fst=$(json_get "$REPLY_BODY" timestamp)
+      case "$fst" in ''|*[!0-9]*) fst=0 ;; esac
+      break
+    done < "$AGENT_DIR/.adoptfiles"
+    rm -f "$AGENT_DIR/.adoptfiles" 2>/dev/null
+    # No server record for any format: cleared; stop probing, allow a later
+    # baseline push if the book is ever read locally.
+    if [ -z "$found" ]; then
+      sentinel_clear "$oid"
+      cleared=$(expr "$cleared" + 1)
+      continue
+    fi
+    # The device already shows the same position: record the reference and move on.
+    if local_progress "$oid" >/dev/null 2>&1; then
+      if [ "$(norm_loc "$LP_POS")" = "$(norm_loc "$fsprog")" ]; then
+        state_set "$oid" "$fdigest" "$fspct" "$LP_POS" "$fst" "$(now)"
+        cleared=$(expr "$cleared" + 1)
+        continue
+      fi
+    fi
+    # Actively reading on this device? Never yank an open book — retry next cycle.
+    hu=$(book_hashuuid "$oid")
+    bdir=""; [ -n "$hu" ] && bdir="$READER_STATE_DIR/$(printf '%s' "$hu" | tr 'A-Z' 'a-z')"
+    if reader_busy "$bdir"; then
+      log "adopt[$oid]: reader busy; will adopt next cycle"
+      continue
+    fi
+    apply_pull "$oid" "$ftarget" "$fsprog" "$fspct" "$fst"
+    state_set "$oid" "$fdigest" "$fspct" "$APPLIED_PBR" "$fst" "$(now)"
+    adopted=$(expr "$adopted" + 1)
+  done
+  log "adopt: done (adopted=$adopted cleared=$cleared)"
+  return 0
+}
+
 cmd_pull() {
   card_ready || { log "pull: card not ready"; return 1; }
   # NOTE: no global reader guard here — the reader process lingers after the
@@ -609,6 +722,9 @@ cmd_pull() {
 # --- commands ----------------------------------------------------------------
 cmd_once() {
   trim_log
+  # Same order as the loop: adopt (pull-side) before push, so a never-synced
+  # book is read from the server before any local baseline is pushed.
+  if [ "$PULL_ENABLED" = "1" ]; then cmd_adopt; fi
   cmd_push
   if [ "$PULL_ENABLED" = "1" ]; then cmd_pull; fi
 }
@@ -646,7 +762,25 @@ cmd_loop() {
   offline_streak=0
   while :; do
     if card_ready; then
+      # Pull-side FIRST, on the pull interval: adopt any never-synced book from
+      # the server, then apply newer records. For a book we have never synced
+      # the server must be consulted BEFORE any push, or a fresh page 1 would
+      # clobber the other device's position. (Per-book reader-busy guarded.)
+      n=$(now)
+      if [ "$PULL_ENABLED" = "1" ]; then
+        dl=$(expr "$n" - "$last_pull" 2>/dev/null)
+        case "$dl" in ''|*[!0-9]*) dl=999999 ;; esac  # expr exits 1 when the result is 0; test the output
+        if [ "$dl" -ge "$PULL_SEC" ]; then
+          if auth_ok; then
+            offline_streak=0
+            cmd_adopt
+            cmd_pull
+          fi
+          last_pull=$n
+        fi
+      fi
       # Push: only touch the network if a local change is actually pending.
+      # (Never-synced books are deferred until adoption has looked at the server.)
       if local_pending_push; then
         if auth_ok; then
           offline_streak=0
@@ -656,19 +790,6 @@ cmd_loop() {
           if [ "$offline_streak" -le 1 ] || [ "$(expr "$offline_streak" % 20)" -eq 0 ]; then
             log "loop: push pending but offline/auth failed (${REPLY_CODE:-?}): ${REPLY_BODY:-}"
           fi
-        fi
-      fi
-      # Pull: on an interval, regardless of push state (reader-idle guarded inside).
-      n=$(now)
-      if [ "$PULL_ENABLED" = "1" ]; then
-        dl=$(expr "$n" - "$last_pull" 2>/dev/null)
-        case "$dl" in ''|*[!0-9]*) dl=999999 ;; esac  # expr exits 1 when the result is 0; test the output
-        if [ "$dl" -ge "$PULL_SEC" ]; then
-          if auth_ok; then
-            offline_streak=0
-            cmd_pull
-          fi
-          last_pull=$n
         fi
       fi
     fi
@@ -748,6 +869,7 @@ cmd=${1:-}
 case "$cmd" in
   push)         card_ready && cmd_push ;;
   pull)         card_ready && cmd_pull ;;
+  adopt)        card_ready && cmd_adopt ;;
   once)         cmd_once ;;
   loop)         cmd_loop ;;
   check-auth)   cmd_check_auth ;;
@@ -784,7 +906,7 @@ case "$cmd" in
     fi
     ;;
   *)
-    echo "usage: $0 {push|pull|once|loop|check-auth|localcheck [oid...]|status|digest <file>|stop}" >&2
+    echo "usage: $0 {push|pull|adopt|once|loop|check-auth|localcheck [oid...]|status|digest <file>|stop}" >&2
     exit 2
     ;;
 esac
