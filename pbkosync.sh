@@ -140,6 +140,41 @@ norm_loc() { # canonical form for comparing positions across writers
   printf 'raw:%s' "$s"
 }
 
+# Classify a book file by extension so position handling is format-specific:
+#   EPUB  -> CFI (pbr:/webkit?##epubcfi(...) / pbr:/img|char|word?...#epubcfi)
+#   PDF   -> page + pdfloc (pbr:/page?page=N##pdfloc(...))
+#   CBZ/CBR -> plain page number. KOReader reports a 1-based page; the PocketBook
+#              reader resumes a comic from pbr:/page?page=N where N is 0-based
+#              (displayed page = N+1). This base mismatch is the whole comic bug.
+book_kind() { # $1=path -> "epub" | "pdf" | "comic" | "other"
+  b=$(printf '%s' "$1" | tr 'A-Z' 'a-z' | sed 's/^.*\.//')
+  case "$b" in
+    epub)      printf 'epub' ;;
+    pdf)       printf 'pdf' ;;
+    cbz|cbr)   printf 'comic' ;;
+    *)         printf 'other' ;;
+  esac
+}
+
+# Canonical comparison key, kind-aware. For comics, normalize both a LOCAL
+# (reader, 0-based, carries "page=") position and a SERVER (KOReader, 1-based,
+# bare number) progress to the KOReader 1-based page so equal pages compare
+# equal across the two devices. Non-comics fall back to the generic norm_loc.
+norm_key() { # $1=position_or_progress $2=kind
+  if [ "$2" = "comic" ]; then
+    p=$(extract_page "$1")
+    case "$p" in ''|*[!0-9]*) p=$1 ;; esac
+    case "$p" in ''|*[!0-9]*) p=0 ;; esac
+    if printf '%s' "$1" | grep -q 'page='; then   # reader form (0-based): lift to 1-based
+      p=$(expr "$p" + 1 2>/dev/null)
+      case "$p" in ''|*[!0-9]*) p=0 ;; esac
+    fi
+    printf 'page:%s' "$p"
+    return 0
+  fi
+  norm_loc "$1"
+}
+
 # CRC32 of a file (lowercase hex), matching the checksum the PocketBook
 # reader stores as the last line of its *.cfg state files (verified:
 # crc32 of the content above the "#xxxx" line).
@@ -323,7 +358,7 @@ pick_target() { # $1=files(newline) $2=position -> one path
 # always update it), so it is only a fallback.
 # Sets: LP_POS (pbr/CFI string), LP_PCT (0..1 float), LP_TARGET (file path).
 local_progress() { # $1=oid
-  LP_POS=""; LP_PCT=""; LP_TARGET=""
+  LP_POS=""; LP_PCT=""; LP_TARGET=""; LP_NPAGE=""
   lp_files=$(book_files "$1")
   [ -n "$lp_files" ] || return 1
   lp_dbpos=$(book_position "$1")
@@ -345,6 +380,7 @@ local_progress() { # $1=oid
         lp_cp=${lp_cn%%|*}; lp_np=${lp_cn##*|}
         case "$lp_cp" in ''|*[!0-9]*) lp_cp="" ;; esac
         case "$lp_np" in ''|*[!0-9]*) lp_np="" ;; esac
+        [ -n "$lp_np" ] && LP_NPAGE=$lp_np
         if [ -n "$lp_cp" ] && [ -n "$lp_np" ]; then
           LP_PCT=$(awk -v a="$lp_cp" -v b="$lp_np" 'BEGIN{printf "%.17g", a/b}')
         fi
@@ -435,8 +471,9 @@ push_due() { # $1=oid -> 0 if due
       return 1   # defer until the adoption pass has consulted the server
     fi
   fi
-  lp=$(norm_loc "$LP_POS")
-  sp=$(norm_loc "${ST_PPOS:-}")
+  bk=$(book_kind "$LP_TARGET")
+  lp=$(norm_key "$LP_POS" "$bk")
+  sp=$(norm_key "${ST_PPOS:-}" "$bk")
   [ "$lp" = "$sp" ] && return 1   # same reading position as last sync
   if [ "${ST_DEVTS:-0}" -gt 0 ] 2>/dev/null; then
     age=$(expr "$(now)" - "$ST_DEVTS" 2>/dev/null)
@@ -479,7 +516,20 @@ cmd_push() {
       fi
     fi
     # Choose the progress locator to send (KOSync-friendly).
-    if printf '%s' "$pos" | grep -q 'epubcfi'; then
+    bk=$(book_kind "$target")
+    if [ "$bk" = "comic" ]; then
+      # Reader stores a 0-based page (pbr:/page?page=N); KOReader expects a
+      # bare 1-based page number for comics. Send the 1-based number, and keep
+      # the percentage on the SAME (1-based) scale so progress and pct agree
+      # (a real KOReader/phone sends page N and N/total, not (N-1)/total).
+      page=$(extract_page "$pos")
+      case "$page" in ''|*[!0-9]*) page=0 ;; esac
+      loc=$(expr "$page" + 1 2>/dev/null)
+      case "$loc" in ''|*[!0-9]*) loc=$pos ;; esac
+      if [ -n "${LP_NPAGE:-}" ] && [ "${LP_NPAGE:-0}" -gt 0 ] 2>/dev/null; then
+        prog=$(awk -v a="$loc" -v b="$LP_NPAGE" 'BEGIN{printf "%.17g", a/b}')
+      fi
+    elif printf '%s' "$pos" | grep -q 'epubcfi'; then
       loc=$(extract_cfi "$pos")
     else
       page=$(extract_page "$pos")
@@ -589,8 +639,9 @@ ex_apply() { # $1=oid $2=target $3=pbr $4=spct
 apply_pull() { # $1=oid $2=target $3=server_progress $4=server_percentage $5=server_ts
   oid=$1; target=$2; sprog=$3; spct=$4; sts=$5
   # Build a pbr: URI the native reader understands, based on the format.
-  case "$target" in
-    *.pdf)
+  bk=$(book_kind "$target")
+  case "$bk" in
+    pdf)
       ap_page=$(extract_page "$sprog")
       if [ -z "$ap_page" ]; then
         case "$sprog" in
@@ -599,6 +650,25 @@ apply_pull() { # $1=oid $2=target $3=server_progress $4=server_percentage $5=ser
         esac
       fi
       APPLIED_PBR="pbr:/page?page=${ap_page:-0}"
+      ;;
+    comic)
+      # The reader resumes a comic from pbr:/page?page=N where N is 0-based
+      # (verified on-device: reader on displayed page 51 stored page=50), and
+      # cpage is set from this same page in ex_apply. Two server shapes exist:
+      #   * KOReader / phone: a bare 1-based page number (e.g. "34")  -> N-1.
+      #   * legacy records written by the OLD pb-kosync push: "page=N",
+      #     which is ALREADY the reader's 0-based page (displayed = N+1) -> N.
+      # Distinguish by shape (a real KOReader never sends "page=" for a comic),
+      # keeping this consistent with the norm_key() gate.
+      ap_page=$(extract_page "$sprog")
+      if printf '%s' "$sprog" | grep -q 'page='; then
+        case "$ap_page" in ''|*[!0-9]*) ap_page=0 ;; esac
+      else
+        [ -n "$ap_page" ] || ap_page=$sprog
+        case "$ap_page" in ''|*[!0-9]*) ap_page=0 ;; esac
+        if [ "$ap_page" -gt 0 ] 2>/dev/null; then ap_page=$(expr "$ap_page" - 1); fi
+      fi
+      APPLIED_PBR="pbr:/page?page=${ap_page}"
       ;;
     *)
       ap_cfi=$(extract_cfi "$sprog")
@@ -671,7 +741,8 @@ cmd_adopt() {
     fi
     # The device already shows the same position: record the reference and move on.
     if local_progress "$oid" >/dev/null 2>&1; then
-      if [ "$(norm_loc "$LP_POS")" = "$(norm_loc "$fsprog")" ]; then
+      abk=$(book_kind "$ftarget")
+      if [ "$(norm_key "$LP_POS" "$abk")" = "$(norm_key "$fsprog" "$abk")" ]; then
         state_set "$oid" "$fdigest" "$fspct" "$LP_POS" "$fst" "$(now)"
         cleared=$(expr "$cleared" + 1)
         continue
@@ -718,7 +789,8 @@ cmd_pull() {
     # position actually differs (formats compared after normalization).
     case "$sts" in ''|*[!0-9]*) sts=0 ;; esac
     [ "$sts" -gt "${ST_REFTS:-0}" ] 2>/dev/null || continue
-    sn=$(norm_loc "$sprog"); ln=$(norm_loc "$pos")
+    pk=$(book_kind "$target")
+    sn=$(norm_key "$sprog" "$pk"); ln=$(norm_key "$pos" "$pk")
     [ "$sn" = "$ln" ] && continue
     hu=$(book_hashuuid "$oid")
     bdir=""; [ -n "$hu" ] && bdir="$READER_STATE_DIR/$(printf '%s' "$hu" | tr 'A-Z' 'a-z')"
