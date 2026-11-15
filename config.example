@@ -18,6 +18,8 @@ PUSH_COOLDOWN=90   # min seconds between pushes of the same book
 # book while the reader is alive AND its position state changed within this
 # window (active reading). After that the book is considered closed.
 PULL_READER_BUSY_SEC=120
+# Process pattern of the native reader (used by the busy guard).
+# READER_PROC=eink-reader
 
 CURL_MAX=20        # per-request timeout (s)
 
