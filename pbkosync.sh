@@ -1010,7 +1010,7 @@ cmd_localcheck() {
 cmd=${1:-}
 case "$cmd" in
   push)         card_ready && cmd_push ;;
-  flush)        PUSH_FORCE=1; card_ready && cmd_push ;;
+  flush)        PUSH_FORCE=1; CURL_MAX=5; card_ready && cmd_push ;;
   pull)         card_ready && cmd_pull ;;
   adopt)        card_ready && cmd_adopt ;;
   once)         cmd_once ;;
