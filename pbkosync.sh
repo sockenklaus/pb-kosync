@@ -517,7 +517,7 @@ push_due() { # $1=oid -> 0 if due
   if [ "${ST_DEVTS:-0}" -gt 0 ] 2>/dev/null; then
     age=$(expr "$(now)" - "$ST_DEVTS" 2>/dev/null)
     case "$age" in ''|*[!0-9]*) age=999999 ;; esac  # expr exits 1 when the result is 0; test the output
-    [ "$age" -lt "$PUSH_COOLDOWN" ] && return 1
+    [ "$age" -lt "$PUSH_COOLDOWN" ] && [ "${PUSH_FORCE:-0}" != "1" ] && return 1
   fi
   return 0
 }
@@ -525,6 +525,7 @@ push_due() { # $1=oid -> 0 if due
 # Iterate books that have progress and push any that changed locally.
 cmd_push() {
   card_ready || { log "push: card not ready ($BOOKS_DB unreadable)"; return 1; }
+  [ "${PUSH_FORCE:-0}" = "1" ] && log "push: forced flush (cooldown bypassed)"
   log "push: scanning library"
   oids=$(progress_oids)
   [ -n "$oids" ] || { log "push: no books with progress"; return 0; }
@@ -1009,6 +1010,7 @@ cmd_localcheck() {
 cmd=${1:-}
 case "$cmd" in
   push)         card_ready && cmd_push ;;
+  flush)        PUSH_FORCE=1; card_ready && cmd_push ;;
   pull)         card_ready && cmd_pull ;;
   adopt)        card_ready && cmd_adopt ;;
   once)         cmd_once ;;
