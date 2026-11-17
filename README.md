@@ -1,10 +1,10 @@
 # pb-kosync
 
-> **Disclaimer:** This project was entirely vibe-coded with [Qwen3.8-27b](https://huggingface.co/Qwen/Qwen3-8B). No human wrote a single line of code.
+> **Disclaimer:** This project was entirely vibe-coded with [Qwen3.8-27b](https://huggingface.co/Qwen/Qwen3-8B). I didn't write a single line of code.
 
 ## What it does
 
-Bidirectional read-progress sync between the **PocketBook Era Color** native reader and **Calibre-Web-Automated (CWA)** over the [KOSync](https://github.com/koreader/kosync) protocol.
+Bidirectional read-progress sync between the **PocketBook Era Color** native reader and [**Calibre-Web Automated (CWA)**](https://github.com/crocodilestick/Calibre-Web-Automated) over the [kosync](https://github.com/pid1/kosync-conformance) protocol.
 
 - **Push**: when you read on the device, the position is sent to CWA (with a 90 s cooldown and a regression guard so a page-1 reset can't clobber your real progress).
 - **Pull**: when CWA has a newer position (e.g. you read on your phone), the agent writes it into the reader's canonical store so the device resumes at the right page.
@@ -30,7 +30,7 @@ The agent runs over root SSH. PocketBook ships with SSH disabled; you must enabl
    ssh -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa root@192.168.205.1
    ```
 
-Source: [MobileRead thread](https://www.mobileread.com/forums/showthread.php?t=371671), [redguard.ch advisory](https://www.redguard.ch/blog/2025/03/04/security-advisory-pocketbook-inkpad-color-3/).
+Source: [MobileRead thread](https://www.mobileread.com/forums/showthread.php?t=371671).
 
 ### 2. Deploy the agent
 
