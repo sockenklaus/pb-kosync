@@ -1,6 +1,6 @@
 # pb-kosync
 
-> **Disclaimer:** This project was entirely vibe-coded with [Qwen3.8-27b](https://huggingface.co/Qwen/Qwen3-8B). I didn't write a single line of code.
+> **Disclaimer:** This project was entirely vibe-coded with [Qwen3.8-27b](https://huggingface.co/Qwen/Qwen3.8-27B). I didn't write a single line of code.
 
 ## What it does
 
